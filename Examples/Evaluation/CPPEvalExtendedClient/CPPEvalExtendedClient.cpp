@@ -22,13 +22,10 @@ using namespace Microsoft::MSR::CNTK;
 template<typename ElemType>
 using GetEvalProc = void(*)(IEvaluateModelExtended<ElemType>**);
 
-typedef std::pair<std::wstring, std::vector<float>*> Variable;
-typedef std::map<std::wstring, std::vector<float>*> Variables;
-
 std::unordered_map<std::string, size_t> buildVocab(std::string filePath)
 {
     std::ifstream ifs(filePath);
-    size_t idx = 1;
+    size_t idx = 0;
 
     std::unordered_map<std::string, size_t> vocab;
     std::string line;
@@ -39,7 +36,6 @@ std::unordered_map<std::string, size_t> buildVocab(std::string filePath)
     }
 
     ifs.close();
-
     return vocab;
 }
 
@@ -57,7 +53,6 @@ std::unordered_map<size_t, std::string> buildInvVocab(std::string filePath)
     }
 
     ifs.close();
-
     return vocab;
 }
 
@@ -104,7 +99,7 @@ std::vector<std::string> feedInputVectors(std::string sentence, std::unordered_m
 {
     std::vector<std::string> words;
 
-    // split input sentence by space
+    // split input sentence by space.
     char delimiters = ' ';
     size_t begin = 0;
     size_t end = sentence.find_first_of(delimiters);
@@ -257,6 +252,7 @@ int main(int argc, char* argv[])
     std::unordered_map<size_t, std::string> idx2wordVocab = buildInvVocab(targetVocab);
 
     // input example, do language understanding by this sentence
+    // One single space is used as word sperator. 
     std::string inputSequences = "BOS i would like to find a flight from charlotte to las vegas that makes a stop in st. louis EOS";
 
     Values<float> inputBuffers = inputLayouts.CreateBuffers<float>(inputBufferSize);
