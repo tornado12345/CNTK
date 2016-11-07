@@ -126,6 +126,7 @@ def Convolution(filter_shape,        # e.g. (3,3)
                 activation=activation_default_or_None,
                 init=init_default_or_glorot_uniform,
                 pad=pad_default_or_False,
+                lower_pad=(0,),
                 strides=1,
                 sharing=True,     # (must be True currently)
                 bias=bias_default_or_True,
@@ -163,6 +164,7 @@ def Convolution(filter_shape,        # e.g. (3,3)
                            strides=_as_tuple(strides),
                            sharing=_as_tuple(sharing),
                            auto_padding=_as_tuple(pad),
+                           lower_pad=lower_pad,
                            # TODO: can we rename auto_padding to pad?
                            transpose=transpose,
                            max_temp_mem_size_in_samples=max_temp_mem_size_in_samples)
@@ -180,10 +182,11 @@ from cntk.cntk_py import PoolingType_Max, PoolingType_Average
 def Pooling(op,      # PoolingType_Max or _Average
             filter_shape,  # e.g. (3,3)
             strides=1,
-            pad=False):
+            pad=False,
+            lower_pad=(1,)):
     #UntestedBranchError("Pooling")
     x = Placeholder(name='pooling_arg')
-    apply_x = pooling (x, op, filter_shape, strides=_as_tuple(strides), auto_padding=_as_tuple(pad))
+    apply_x = pooling (x, op, filter_shape, strides=_as_tuple(strides), auto_padding=_as_tuple(pad), lower_pad=lower_pad)
 
     if op == PoolingType_Average:
         op_name = 'AveragePooling'
