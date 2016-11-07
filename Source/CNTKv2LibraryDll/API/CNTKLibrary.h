@@ -3646,6 +3646,7 @@ namespace CNTK
     /// A collection of additional information needed for the distributed trainer to aggregate the gradients
     struct MinibatchInfo
     {
+        bool last;
         size_t numberOfSamples;
         NDArrayViewPtr trainingLossValue;
         NDArrayViewPtr evalCriterionValue;
