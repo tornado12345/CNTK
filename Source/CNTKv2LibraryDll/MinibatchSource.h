@@ -29,6 +29,7 @@ namespace CNTK
 
         virtual Dictionary GetCheckpointState() const override;
         virtual void RestoreFromCheckpoint(const Dictionary& checkpoint) override;
+        virtual bool HasReachedEndOfSweep() const override;
 
     private:
         static Microsoft::MSR::CNTK::InputStreamDescription GetInputStreamDescription(const StreamInformation& s, const DeviceDescriptor& device)

@@ -3107,7 +3107,6 @@ namespace CNTK
         ///
         virtual size_t CurrentVersion() const override { NOT_IMPLEMENTED }
 
-
         ///
         /// Sets a new learning rate overriding the schedule parameter used to construct this learner.
         ///
@@ -3120,6 +3119,14 @@ namespace CNTK
         /// Resets smoothed gradients.
         ///
         virtual void ResetSmoothedGradients() = 0;
+
+        ///
+        /// Increments the sweep counter internal to the learner.
+        ///
+        void IncrementSweepCount()
+        {
+            m_sweepCount++;
+        }
 
         ///
         /// Returns current (per-sample) learning rate.
@@ -3416,6 +3423,14 @@ namespace CNTK
         /// Optionally overridable method to restore the MinibatchSource's state from a previous checkpoint.
         ///
         virtual void RestoreFromCheckpoint(const Dictionary& /*checkpoint*/) {}
+
+        ///
+        /// Returns true when the source is currently at the end of the sweep.
+        ///
+        virtual bool HasReachedEndOfSweep() const
+        {
+            return false;
+        }
 
     public:
         ///

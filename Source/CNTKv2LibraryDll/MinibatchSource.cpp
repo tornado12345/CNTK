@@ -127,9 +127,6 @@ namespace CNTK
         if (augmentedConfiguration.Contains(epochSizeConfigurationKey))
             m_epochSize = augmentedConfiguration[epochSizeConfigurationKey].Value<size_t>();
 
-        if (m_epochSize == MinibatchSource::FullDataSweep)
-            m_epochSize = Microsoft::MSR::CNTK::requestDataSize;
-
         const wchar_t* truncatedConfigurationKey = L"truncated";
         const wchar_t* truncationLengthConfigurationKey = L"truncationLength";
         if (augmentedConfiguration.Contains(truncatedConfigurationKey) &&
@@ -158,6 +155,12 @@ namespace CNTK
     {
         m_minibatchData.clear();
 
+        if (m_epochSize == MinibatchSource::InfinitelyRepeat)
+        {
+            m_epochEndReached = false;
+            m_prevMinibatchSize = 0; // force-start a new epoch (sweep)
+        }
+
         if (!m_epochEndReached)
         {
             if (minibatchSizeInSequences != 0)
@@ -175,6 +178,9 @@ namespace CNTK
                 epochConfig.m_truncationSize = m_truncationLength;
 
                 epochConfig.m_totalEpochSizeInSamples = m_epochSize;
+                if (m_epochSize == MinibatchSource::FullDataSweep || m_epochSize == MinibatchSource::InfinitelyRepeat)
+                    epochConfig.m_totalEpochSizeInSamples = Microsoft::MSR::CNTK::requestDataSize;
+                
                 epochConfig.m_epochIndex = 0;
                 m_matrices.clear();
 
@@ -271,5 +277,10 @@ namespace CNTK
     {
         auto checkpointedMinibatchSourcePosition = checkpoint[MinibatchSourcePositionAttributeName].Value<size_t>();
         m_shim->SetCurrentSamplePosition(checkpointedMinibatchSourcePosition);
+    }
+
+    /*virtual*/ bool CompositeMinibatchSource::HasReachedEndOfSweep() const /*override*/ 
+    {
+        return (m_epochSize == MinibatchSource::FullDataSweep || m_epochSize == MinibatchSource::InfinitelyRepeat) && m_epochEndReached;
     }
 }
