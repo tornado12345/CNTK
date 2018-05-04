@@ -44,6 +44,14 @@ void ComputationNetwork::ForwardProp(const ComputationNodeBasePtr rootNode)
     GetNestedNetwork(rootNode)->ForwardProp(FrameRange(nullptr));
 }
 
+void ComputationNetwork::PostForwardAndBackProp(const ComputationNodeBasePtr rootNode)
+{
+    VerifyIsCompiled("PostForwardAndBackProp");
+
+    // traverse all nodes in the pre-determined evaluation order
+    GetNestedNetwork(rootNode)->PostForwardAndBackProp();
+}
+
 // set the gradient matrix of a (root) node 1.0
 // Returns false if the node is not a ComputationNode<ElemType>; see Backprop() below for intended use.
 template <class ElemType>
@@ -103,7 +111,7 @@ ComputationNodeBasePtr ComputationNetwork::GetNestedNetwork(const ComputationNod
 // concurrent computation in bulk CUDA launches.
 // -----------------------------------------------------------------------
 
-template<class ElemType> static bool DumpNode(ComputationNodeBasePtr nodep, bool dumpGradient);
+static bool DumpNode(ComputationNodeBasePtr nodep, bool dumpGradient);
 
 ComputationNetwork::PARTraversalFlowControlNode::PARTraversalFlowControlNode(const std::vector<shared_ptr<SEQTraversalFlowControlNode>>& recurrentInfo, const std::list<ComputationNodeBasePtr>& allNodes /*must be in eval order*/)
 {
@@ -132,28 +140,42 @@ ComputationNetwork::PARTraversalFlowControlNode::PARTraversalFlowControlNode(con
         }
     }
 }
+/*static*/ void ComputationNetwork::PARTraversalFlowControlNode::ForwardProp(const ComputationNodeBasePtr& node, const FrameRange& fr)
+{
+    if (node->IsOutOfDateWrtInputs())
+    {
+        node->BeginForwardProp();
+        node->BeginTiming(false /*backward*/);
+        node->ForwardProp(fr.WithLayout(node->GetMBLayout()));
+        node->EndTiming(false /*backward*/);
+        node->EndForwardProp();
+
+        node->BumpEvalTimeStamp();
+
+        // Extreme Tracing, part 1/4
+        if (node->HasEnvironmentPtr() && node->Environment().ShouldDumpNode())
+            DumpNode(node, /*dumpGradient=*/false);
+    }
+}
+
+
 /*virtual*/ void ComputationNetwork::PARTraversalFlowControlNode::ForwardProp(const FrameRange& fr) /*override*/
 {
     for (auto& node : m_nestedNodes)
-    {
-#if 0
-        if (dynamic_pointer_cast<LearnableParameter<float>>(node))
-            dynamic_pointer_cast<ComputationNode<float>>(node)->DebugLogMinibatch();
-#endif
-        if (node->IsOutOfDateWrtInputs())
-        {
-            node->BeginForwardProp();
-            node->ForwardProp(fr.WithLayout(node->GetMBLayout()));
-            node->EndForwardProp();
-
-            node->BumpEvalTimeStamp();
-        }
-
-        // Extreme Tracing, part 1/4
-        if (node->HasEnvironmentPtr() && node->Environment().IsLogLevelNodeTrace())
-            DumpNode<float>(node, /*dumpGradient=*/false) || DumpNode<double>(node, false);
-    }
+        ForwardProp(node, fr);
 }
+
+/*static*/ void ComputationNetwork::PARTraversalFlowControlNode::PostForwardAndBackProp(const ComputationNodeBasePtr& node)
+{
+    node->PostForwardAndBackProp();
+}
+
+/*virtual*/ void ComputationNetwork::PARTraversalFlowControlNode::PostForwardAndBackProp() /*override*/
+{
+    for (auto& node : m_nestedNodes)
+        PostForwardAndBackProp(node);
+}
+
 /*virtual*/ void ComputationNetwork::PARTraversalFlowControlNode::Backprop(const FrameRange& fr, bool childrenInThisLoop, bool childrenInOuterLoop) /*override*/
 {
     childrenInThisLoop, childrenInOuterLoop; // TODO: think through what these mean when coming from PAR mode
@@ -163,12 +185,14 @@ ComputationNetwork::PARTraversalFlowControlNode::PARTraversalFlowControlNode(con
         auto& node = *pnode;
 
         node->BeginBackprop();
+        node->BeginTiming(true /*backward*/);
         node->Backprop(fr.WithLayout(node->GetMBLayout()), true /*childrenInThisLoop*/, true /*childrenInOuterLoop*/);
+        node->EndTiming(true /*backward*/);
         node->EndBackprop();
 
         // Extreme Tracing, part 2/4
-        if (node->HasEnvironmentPtr() && node->Environment().IsLogLevelNodeTrace() && node->NeedsGradient())
-            DumpNode<float>(node, /*dumpGradient=*/true) || DumpNode<double>(node, true);
+        if (node->HasEnvironmentPtr() && node->Environment().ShouldDumpNode() && node->NeedsGradient())
+            DumpNode(node, /*dumpGradient=*/true);
     }
 }
 /*virtual*/ void ComputationNetwork::PARTraversalFlowControlNode::RequestMatricesBeforeForwardProp(MatrixPool& matrixPool) /*override*/
@@ -187,23 +211,34 @@ ComputationNetwork::PARTraversalFlowControlNode::PARTraversalFlowControlNode(con
 {
 }
 
-// helper for logging. Returns false if it was not able to dynamic-cast nodep to ComputationNode<ElemType>
-template<class ElemType>
-static bool DumpNode(ComputationNodeBasePtr nodep, bool dumpGradient)
+template<typename ElemType>
+bool TypedDumpNode(shared_ptr<ComputationNode<ElemType>> node, bool dumpGradient)
 {
-    let node = dynamic_pointer_cast<ComputationNode<ElemType>>(nodep);
     if (!node)
         return false;
     let dataPtr = dumpGradient ? node->GradientPtr() : node->ValuePtr();
     if (!dataPtr)
         return true; // e.g. SEQ sentinel node
-    if (dataPtr->GetMatrixType() != MatrixType::DENSE) // for now we can only print dense matrices; since this is for debugging, don't fail just skip
-        return true;
+
+    bool concise = !(node->Environment().IsLogLevelNodeTrace());
+
     fprintf(stderr, "Dump --> %s%s\n", node->FormatOperationPrototype("").c_str(), dumpGradient ? " Grad" : "");
     node->WriteMinibatchWithFormatting(stderr, FrameRange(), SIZE_MAX, SIZE_MAX, false/*transpose*/, /*isCategoryLabel=*/false, /*isSparse=*/false, std::vector<std::string>(),
-                                       ""/*sequenceSeparator*/, "  "/*sequencePrologue*/, "\n"/*sequenceEpilogue*/, " "/*elementSeparator*/, "\n  "/*sampleSeparator*/,
-                                       "%13.10f"/*valueFormatString*/, dumpGradient);
+        ""/*sequenceSeparator*/, "  "/*sequencePrologue*/, "\n"/*sequenceEpilogue*/, " "/*elementSeparator*/, "\n  "/*sampleSeparator*/,
+        "%13.10f"/*valueFormatString*/, dumpGradient, concise);
     return true;
+}
+
+// helper for logging. Returns false if it was not able to dump
+static bool DumpNode(ComputationNodeBasePtr nodep, bool dumpGradient)
+{
+    let nodef = dynamic_pointer_cast<ComputationNode<float>>(nodep);
+    if (nodef) return TypedDumpNode<float>(nodef, dumpGradient);
+    let noded = dynamic_pointer_cast<ComputationNode<double>>(nodep);
+    if (noded) return TypedDumpNode<double>(noded, dumpGradient);
+    let nodeh = dynamic_pointer_cast<ComputationNode<half>>(nodep);
+    if (nodeh) return TypedDumpNode<half>(nodeh, dumpGradient);
+    return false;
 }
 
 // -----------------------------------------------------------------------
@@ -249,7 +284,9 @@ static bool DumpNode(ComputationNodeBasePtr nodep, bool dumpGradient)
     {
         for (auto& node : m_nestedNodes)
         {
+            node->BeginTiming(false /*backward*/);
             node->ForwardProp(t);
+            node->EndTiming(false /*backward*/);
             node->BumpEvalTimeStamp();
         }
     }
@@ -257,9 +294,9 @@ static bool DumpNode(ComputationNodeBasePtr nodep, bool dumpGradient)
     // Extreme Tracing, part 3/4
     for (auto& node : m_nestedNodes)
     {
-        if (node->HasEnvironmentPtr() && node->Environment().IsLogLevelNodeTrace())
+        if (node->HasEnvironmentPtr() && node->Environment().ShouldDumpNode())
         {
-            DumpNode<float>(node, /*dumpGradient=*/false) || DumpNode<double>(node, false);
+            DumpNode(node, /*dumpGradient=*/false);
         }
     }
 }
@@ -289,7 +326,9 @@ static bool DumpNode(ComputationNodeBasePtr nodep, bool dumpGradient)
         for (auto nodeIter2 = recurrentNodes.rbegin(); nodeIter2 != recurrentNodes.rend(); ++nodeIter2)
         {
             auto& node2 = *nodeIter2;
+            node2->BeginTiming(true /*backward*/);
             node2->Backprop(t, true /*childrenInThisLoop*/, false /*childrenInOuterLoop*/);
+            node2->EndTiming(true /*backward*/);
             // The above flags tell Backprop() to skip back-propagation from inside a node into
             // a node that is outside the loop, which is done later in EndBackprop() in PAR mode.
         }
@@ -298,9 +337,9 @@ static bool DumpNode(ComputationNodeBasePtr nodep, bool dumpGradient)
     // Extreme Tracing, part 4
     for (auto& node : m_nestedNodes)
     {
-        if (node->HasEnvironmentPtr() && node->Environment().IsLogLevelNodeTrace() && node->NeedsGradient())
+        if (node->HasEnvironmentPtr() && node->Environment().ShouldDumpNode() && node->NeedsGradient())
         {
-            DumpNode<float>(node, /*dumpGradient=*/true) || DumpNode<double>(node, true);
+            DumpNode(node, /*dumpGradient=*/true);
         }
     }
 }
@@ -387,6 +426,16 @@ void ComputationNetwork::ResetEvalTimeStamps()
         nodeIter->second->ResetEvalTimeStamp();
 }
 
+// Set EvalTimeStamp of all nodes as outdated, so that each node will be evaluated at least once.
+// The ResetEvalTimeStamps() above cannot do the work, since it only (re)sets the node to the current
+// global timestamp, which could be updated by other threads, so that the nodes of the network might
+// have different timestamps and the nodes with a higher timestamps are not treated as "outdated".
+void ComputationNetwork::SetEvalTimeStampsOutdatedWithRegardToAll()
+{
+    for (auto nodeIter = m_nameToNodeMap.begin(); nodeIter != m_nameToNodeMap.end(); nodeIter++)
+        nodeIter->second->SetEvalTimeStampOutdatedWrtAll();
+}
+
 /*static*/ void ComputationNetwork::BumpEvalTimeStamp(const vector<ComputationNodeBasePtr>& nodes)
 {
     for (size_t i = 0; i < nodes.size(); i++)
@@ -448,7 +497,7 @@ void ComputationNetwork::VerifyIsCompiled(const char* where) const
 void ComputationNetwork::CompileNetwork()
 {
     if (TraceLevel() > 0)
-    fprintf(stderr, "\nPost-processing network...\n");
+        fprintf(stderr, "\nPost-processing network...\n");
 
     // We may only get here if not !IsCompiled(). We could now verify each member to be virgin.
     // Or just invalidate it again, which is easier and safer.
@@ -459,9 +508,9 @@ void ComputationNetwork::CompileNetwork()
 
     if (TraceLevel() > 0)
     {
-    fprintf(stderr, "\n%d roots:\n", (int)m_allRoots.size());
-    for (const auto& root : m_allRoots)
-        fprintf(stderr, "\t%ls = %ls()\n", root->NodeName().c_str(), root->OperationName().c_str());
+        fprintf(stderr, "\n%d roots:\n", (int)m_allRoots.size());
+        for (const auto& root : m_allRoots)
+            fprintf(stderr, "\t%ls = %ls()\n", root->NodeName().c_str(), root->OperationName().c_str());
     }
 
     // Note: Steps below are loops over root nodes. We will gradually push those loops through to the functions,
@@ -482,9 +531,7 @@ void ComputationNetwork::CompileNetwork()
     ResetMBLayouts();
 
     // STEP: Discover nested loops.
-    FormRecurrentLoops(nullptr); // form the global one  --TODO: just use this; should be no need to do this for each root
-    //for (auto& node : m_allRoots)
-    //    FormRecurrentLoops(node); // BUGBUG: These calls are needed because they patch EvalOrders. Will be unnecessary once we move this out.
+    FormRecurrentLoops();
 
     // STEP: Create loop-corrected depth-first traversals and cached input/parameter sets for every actual root node.
     for (auto& root : m_allRoots)
@@ -507,7 +554,8 @@ void ComputationNetwork::CompileNetwork()
     ResetEvalTimeStamps(); // invalidate all m_value fields. Really belongs into StartEvaluateMinibatchLoop()
 
     if (TraceLevel() > 0)
-    fprintf(stderr, "\nPost-processing network complete.\n\n");
+        fprintf(stderr, "\nPost-processing network complete.\n\n");
+
     m_isCompiled = true;
 }
 
@@ -673,11 +721,11 @@ void ComputationNetwork::ValidateNetwork()
     for (auto& node : nodes)
     {
         // nodes must output non-zero dimensional data, otherwise assume user error
-        if (node->GetSampleLayout().GetNumElements() == 0)
+        if (!node->m_needsDynamicValidation && node->GetSampleLayout().GetNumElements() == 0)
             RuntimeError("%ls operation has 0 elements", node->NodeName().c_str());
     }
     if (TraceLevel() > 0)
-    fprintf(stderr, "\n\n");
+        fprintf(stderr, "\n\n");
 
     // logging the non-default-layout nodes
     vector<ComputationNodeBasePtr> nonDefaultNodes;
@@ -714,12 +762,20 @@ bool ComputationNetwork::ValidateNode(ComputationNodeBasePtr node, bool isFinalV
     for (auto& child : children)
         childDims.push_back(GetDims(child));
     auto sampleLayout = node->GetSampleLayout();
-    // We do call validate(final) as many times as needed, since stuff may have changed underneath.
-    node->Validate(isFinalValidationPass /*final*/); // all nodes have been visited: do verification instead of just inference
-    // also take the opportunity to propagate m_needsGradient
+
+    // also take the opportunity to propagate m_needsGradient and m_nodeNeedsDynamicValidation
+    auto nodeNeedsDynamicValidation = node->NeedsDynamicValidation();
+    node->m_needsDynamicValidation |= node->ForceDynamicValidation();
     auto needsGradient = node->m_needsGradient;
     for (auto& child : children) // TODO: do we need a check that this is stable if isFinalValidationPass?
+    {
         node->m_needsGradient |= child->m_needsGradient;
+        node->m_needsDynamicValidation |= child->m_needsDynamicValidation;
+    }
+
+    // We do call validate(final) as many times as needed, since stuff may have changed underneath.
+    node->Validate(isFinalValidationPass && !node->m_needsDynamicValidation /*final*/); // all nodes have been visited: do verification instead of just inference
+
     // check state --node will be valid if all nodes have been visited and node has not been updated
     bool unchanged = true;
     unchanged &= (oldMBLayoutPtr == node->GetMBLayout());
@@ -730,6 +786,7 @@ bool ComputationNetwork::ValidateNode(ComputationNodeBasePtr node, bool isFinalV
     unchanged &= (childDims == newChildDims);
     unchanged &= (sampleLayout == node->GetSampleLayout());
     unchanged &= (needsGradient == node->m_needsGradient);
+    unchanged &= (nodeNeedsDynamicValidation == node->m_needsDynamicValidation);
     return !unchanged;
 }
 
@@ -818,6 +875,20 @@ void ComputationNetwork::MarkValueNonSharableNodes()
     for (auto& node : nodes)
     {
         auto inputs = node->GetInputs();
+
+        // Mark the UserDefinedV2FunctionNode and all its inputs as ValueNonShareable, since
+        // the inputs and outputs of a UDF may be externally preserved by the UDF implementation
+        // for bakcpropagation and thus reusing them within the network is not possible as 
+        // we do not control when the user actually releases the input/output Matrices that
+        // they may have help in the backprop state returned from the UDF's forward pass.
+        bool isUserDefinedV2FunctionNode = (node->OperationName() == L"UserDefinedV2Function");
+        if (isUserDefinedV2FunctionNode)
+        {
+            node->MarkValueNonSharable();
+            for (auto input : inputs)
+                input->MarkValueNonSharable();
+        }
+
         wstring myname = node->NodeName();
         bool allParametersOrPreComputeNodes = true;
 
@@ -942,31 +1013,41 @@ void ComputationNetwork::PrintMemorySharingStructure(const vector<ComputationNod
     size_t numUnshared = 0;
     for (const auto& item : memSharingStructure)
     {
-        if (item.second.size() < 2) // only print actually shared matrices
+        if (item.second.size() < 2) // unshared matrices
             numUnshared++;
-        else
+        else                        // shared matrices
             numShared++;
     }
 
-    fprintf(stderr, "\nMemory Sharing: Out of %d matrices, %d are shared as %d, and %d are not shared.\n\n", (int)numMatrices, (int)(numMatrices - numUnshared), (int)numShared, (int)numUnshared);
+    fprintf(stderr, "\nMemory Sharing: Out of %d matrices, %d are shared as %d, and %d are not shared.\n", (int)numMatrices, (int)(numMatrices - numUnshared), (int)numShared, (int)numUnshared);
+
+    fprintf(stderr, "\nHere are the ones that share memory:\n"); 
     for (const auto& item : memSharingStructure)
     {
-        if (item.second.size() < 2) // only print actually shared matrices
-            continue;
-        // Format:
-        // { node1
-        //   node2 }
-        // { node3
-        //   node4
-        //   node5 }
-        // where unshared nodes are not printed.
-        const char* delim = "\t{ ";
-        for (const auto& memShareInfo : item.second)
+        if (item.second.size() >= 2)
         {
-            fprintf(stderr, "%s%ls", delim, memShareInfo.c_str());
-            delim = "\n\t  ";
+            // Format:
+            // { node1
+            //   node2 }
+            // { node3
+            //   node4
+            //   node5 }
+            const char* delim = "\t{ ";
+            for (const auto& memShareInfo : item.second)
+            {
+                fprintf(stderr, "%s%ls", delim, memShareInfo.c_str());
+                delim = "\n\t  ";
+            }
+            fprintf(stderr, " }\n");
         }
-        fprintf(stderr, " }\n");
+    }
+    fprintf(stderr, "\nHere are the ones that don't share memory:\n");
+    for (const auto& item : memSharingStructure)
+    {
+        if (item.second.size() < 2)
+        {
+            fprintf(stderr, "\t{%ls}\n", item.second.begin()->c_str()); 
+        }
     }
     fprintf(stderr, "\n");
 }
@@ -985,7 +1066,7 @@ void ComputationNetwork::AllocateAllMatrices(const std::vector<ComputationNodeBa
 
     // Allocate memory for forward/backward computation
     if (TraceLevel() > 0)
-    fprintf(stderr, "\n\nAllocating matrices for forward and/or backward propagation.\n");
+        fprintf(stderr, "\n\nAllocating matrices for forward and/or backward propagation.\n");
 
     VerifyIsCompiled("AllocateAllMatrices");
 
@@ -1009,10 +1090,14 @@ void ComputationNetwork::AllocateAllMatrices(const std::vector<ComputationNodeBa
     // node is needed during back propagation
     std::unordered_map<ComputationNodeBasePtr, bool> outputValueNeededDuringBackProp;
     std::unordered_map<ComputationNodeBasePtr, std::unordered_set<ComputationNodeBasePtr>> parentsMap;
+    std::unordered_set<ComputationNodeBasePtr> uniqueForwardPropEvalNodes;
     for (auto& rootNode : forwardPropRoots)
     {
         for (const auto& node : GetEvalOrder(rootNode))
         {
+            if (uniqueForwardPropEvalNodes.find(node) == uniqueForwardPropEvalNodes.end())
+                uniqueForwardPropEvalNodes.insert(node);
+
             for (int i = 0; i < node->GetNumInputs(); i++)
             {
                 ComputationNodeBasePtr input = node->GetInputs()[i];
@@ -1026,65 +1111,124 @@ void ComputationNetwork::AllocateAllMatrices(const std::vector<ComputationNodeBa
                     outputValueNeededDuringBackProp[input] |= (node->NeedsGradient() && node->InputUsedInComputingInputNodesGradients(i));
                 }
                 else
-                {
                     outputValueNeededDuringBackProp[input] = false;
-                }
             }
         }
     }
 
-    std::unordered_map<ComputationNodeBasePtr, int> parentCount;
+    // gradient reuse maps
+    std::unordered_map<MatrixPool::AliasNodePtr, std::unordered_set<MatrixPool::AliasNodePtr>> gradientReuseChildrenMap;
+    std::unordered_map<MatrixPool::AliasNodePtr, MatrixPool::AliasNodePtr> gradientReuseParentMap;
     for (auto& keyValue : parentsMap)
     {
-        parentCount[keyValue.first] = keyValue.second.size();
-    }
-
-    // Construct the composite forward prop eval order by enumerating the
-    // nodes corresponding to each of our roots and then arranging them in the
-    // relative order that they appear in the global evaluation order
-    const std::list<ComputationNodeBasePtr>& allNodesEvalOrder = GetEvalOrder(nullptr);
-    std::list<ComputationNodeBasePtr> nodesForForwardPropRoots = ComputationNodeBase::EnumerateNodes(forwardPropRoots);
-    std::vector<ComputationNodeBasePtr> compositeForwardPropEvalOrder;
-    for (auto& node : allNodesEvalOrder)
-    {
-        if (std::find(nodesForForwardPropRoots.cbegin(), nodesForForwardPropRoots.cend(), node) != nodesForForwardPropRoots.cend())
+        // Indicate on the node that it's parent overwrites its gradient if the node is not part of a loop
+        // and has exactly one parent who implements the gradient overwrite optimization
+        if (Globals::ShouldOptimizeGradientAccumulation() &&
+            !keyValue.first->IsPartOfLoop() &&
+            (keyValue.second.size() == 1))
         {
-            compositeForwardPropEvalOrder.push_back(node);
+            auto parent = *keyValue.second.begin();
+            auto opt = parent->ImplementsGradientOptimization(keyValue.first.get());
+            if (opt != ParentGradientOptimization::None && trainRootNode != parent)
+            {
+                // We cannot enable the gradient overwrite/reuse optimization if this node's (lone) parent
+                // has this same node as multiple of its inputs since, in that case the
+                // gradients will flow back from multiple paths of the same parent into the input
+
+                auto& allInputsOfParent = parent->GetInputs();
+                if (std::count(allInputsOfParent.begin(), allInputsOfParent.end(), keyValue.first) <= 1)
+                {
+                    auto child = keyValue.first;
+                    child->SetParentGradientOptimization(opt);
+                    if (opt == ParentGradientOptimization::Reuse)
+                    {
+                        gradientReuseChildrenMap[&*parent].insert(&*child);
+                        if (gradientReuseParentMap.find(&*child) != gradientReuseParentMap.end())
+                            LogicError("Already has a gradient reuse parent.");
+                        gradientReuseParentMap[&*child] = &*parent;
+                    }
+                }
+            }
         }
     }
 
-    set<ComputationNodeBasePtr> completedEvaluate;
-    for (auto& nodeIter : compositeForwardPropEvalOrder)
-    {
-        nodeIter->SetOutputNeededDuringBackprop(outputValueNeededDuringBackProp[nodeIter]);
+    m_matrixPool.Reset();
 
-        if (nodeIter->IsPartOfLoop())
+    TravserseInSortedGlobalEvalOrder(forwardPropRoots, [&outputValueNeededDuringBackProp, &parentsMap, this](const ComputationNodeBasePtr& node) {
+        if (node->Is<SEQTraversalFlowControlNode>())
         {
-            // TODO: use FormNestedNetwork() here to avoid completedEvaluate[] check
-            shared_ptr<SEQTraversalFlowControlNode> recInfo = FindInRecurrentLoops(m_allSEQNodes, nodeIter);
-            assert(recInfo != nullptr);
-            if (completedEvaluate.insert(recInfo).second)
-            {
-                recInfo->RequestMatricesBeforeForwardProp(m_matrixPool);
+            auto seqTraversalFlowControlNode = node->As<SEQTraversalFlowControlNode>();
+            for (auto& loopNode : seqTraversalFlowControlNode->m_nestedNodes)
+                loopNode->SetOutputNeededDuringBackprop(outputValueNeededDuringBackProp[loopNode]);
 
-                for (auto& nodeLoopIter : recInfo->m_nestedNodes)
-                {
-                    ReleaseMatricesAfterEvalForChildren(nodeLoopIter, parentCount);
-                }
-            }
+            seqTraversalFlowControlNode->RequestMatricesBeforeForwardProp(m_matrixPool);
+
+            for (auto& loopNode : seqTraversalFlowControlNode->m_nestedNodes)
+                ReleaseMatricesAfterEvalForChildren(loopNode, parentsMap);
         }
         else
         {
-            nodeIter->RequestMatricesBeforeForwardProp(m_matrixPool);
-            // we only release matrices for the children since the root node's information will be used and should not be shared
-            // with others
-            ReleaseMatricesAfterEvalForChildren(nodeIter, parentCount);
+            node->SetOutputNeededDuringBackprop(outputValueNeededDuringBackProp[node]);
+            node->RequestMatricesBeforeForwardProp(m_matrixPool);
+            // we only release matrices for the children since the root node's information will be used
+            // and should not be shared with others
+            ReleaseMatricesAfterEvalForChildren(node, parentsMap);
         }
-    }
+    });
 
     if (trainRootNode != nullptr)
     {
         const std::list<ComputationNodeBasePtr>& backPropNodes = GetEvalOrder(trainRootNode);
+
+        // compact the alias map for cases like s = a + b + c + d
+
+        std::unordered_map<MatrixPool::AliasNodePtr, std::unordered_set<MatrixPool::AliasNodePtr>> compactGradientAliasMap;
+        std::unordered_map<MatrixPool::AliasNodePtr, MatrixPool::AliasNodePtr> compactGradientAliasRootMap;
+        for (const auto& gradientReuseKeyValue : gradientReuseChildrenMap)
+        {
+            // keep searching parent until reaching root
+
+            auto parent = gradientReuseKeyValue.first;
+            auto parentIter = gradientReuseParentMap.find(parent);
+            while (parentIter != gradientReuseParentMap.end())
+            {
+                parent = parentIter->second;
+                parentIter = gradientReuseParentMap.find(parent);
+            }
+
+            // add children to the alias group under the root
+
+            auto children = gradientReuseKeyValue.second;
+            compactGradientAliasMap[parent].insert(children.begin(), children.end());
+
+            for (const auto& child : children)
+            {
+                if (compactGradientAliasRootMap.find(child) != compactGradientAliasRootMap.end())
+                    LogicError("one node cannot be in two alias group");
+
+                compactGradientAliasRootMap[child] = parent;
+            }
+
+            // and add root itself to the alias group
+
+            compactGradientAliasMap[parent].insert(parent);
+            compactGradientAliasRootMap[parent] = parent;
+        }
+
+        // print the memory aliasing info
+        if (TraceLevel() > 0 && compactGradientAliasRootMap.size() > 0)
+        {
+            fprintf(stderr, "\nGradient Memory Aliasing: %d are aliased.\n", (int)compactGradientAliasRootMap.size());
+            for (const auto pair : compactGradientAliasRootMap)
+            {
+                auto child = (const ComputationNodeBase*)pair.first;
+                auto parent = (const ComputationNodeBase*)pair.second;
+                if (child != parent)
+                    fprintf(stderr, "\t%S (gradient) reuses %S (gradient)\n", child->GetName().c_str(), parent->GetName().c_str());
+            }
+        }
+
+        m_matrixPool.SetAliasInfo(compactGradientAliasMap, compactGradientAliasRootMap);
 
         // now, simulate the gradient computation order to determine how to allocate matrices
         set<ComputationNodeBasePtr> completedGradient;
@@ -1120,21 +1264,32 @@ void ComputationNetwork::AllocateAllMatrices(const std::vector<ComputationNodeBa
         }
     }
 
+    m_matrixPool.OptimizedMemoryAllocation(); 
     m_areMatricesAllocated = true;
+
+    // TO DO: At the time of AllocateAllMatrices we don't know the minibatch size. In theory one may allocate memory again once we start to receive
+    // data from the reader (and the minibatch size is known). For some problems, minibatch size can change constantly, and there needs to be a 
+    // tradeoff in deciding how frequent to run optimized memory allocation. For now, we do it only once at the very beginning for speed concerns. 
+
+    // TO DO: when some matrices are sparse, the memory size request may be wrong. One may need to call OptimizedMemoryAllocation later again 
+    // if the requests of sparse allocation and release are re-processed correctly. Future work. 
 
     // print the memory sharing structure
     if (TraceLevel() > 0)
-    PrintMemorySharingStructure(GetAllNodes());
+        PrintMemorySharingStructure(GetAllNodes());
 }
 
-void ComputationNetwork::ReleaseMatricesAfterEvalForChildren(ComputationNodeBasePtr n, std::unordered_map<ComputationNodeBasePtr, int>& parentCount)
+void ComputationNetwork::ReleaseMatricesAfterEvalForChildren(ComputationNodeBasePtr n, std::unordered_map<ComputationNodeBasePtr, std::unordered_set<ComputationNodeBasePtr>>& parentsMap)
 {
     for (int i = 0; i < n->GetNumInputs(); i++)
     {
         ComputationNodeBasePtr pNode = n->GetInputs()[i];
-        parentCount[pNode]--;
-        if (parentCount[pNode] == 0)
-            pNode->ReleaseMatricesAfterForwardProp(m_matrixPool);
+        if (!parentsMap[pNode].empty())
+        {
+            parentsMap[pNode].erase(n);
+            if (parentsMap[pNode].empty())
+                pNode->ReleaseMatricesAfterForwardProp(m_matrixPool);
+        }
     }
 }
 

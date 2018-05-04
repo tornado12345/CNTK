@@ -4,8 +4,50 @@
 //
 
 #include "TrainingNodes.h"
+#include <boost/random/uniform_real_distribution.hpp>
 
 namespace Microsoft { namespace MSR { namespace CNTK {
+
+template <class ElemType>
+/*virtual*/ void RandomDistributionNode<ElemType>::ForwardProp(const FrameRange& fr) /*override*/
+{
+    auto&& result = ValueFor(fr);
+    switch (m_type)
+    {
+    case RandomDistributionType::Uniform:
+        result.SetUniformRandomValue(GetRNGHandle(), m_args[0], m_args[1]);
+        UpdateRngOffset(GetRngOffset() + result.GetNumElements());
+        break;
+    case RandomDistributionType::Normal:
+        result.SetGaussianRandomValue(GetRNGHandle(), m_args[0], m_args[1]);
+        UpdateRngOffset(GetRngOffset() + AsMultipleOf(result.GetNumElements(), 2));
+        break;
+    case RandomDistributionType::Gumbel:
+        result.SetGumbelRandomValue(GetRNGHandle(), m_args[0], m_args[1]);
+        UpdateRngOffset(GetRngOffset() + result.GetNumElements());
+        break;
+    case RandomDistributionType::Bernoulli:
+        result.SetUniformRandomMask(ElemType(1 - m_args[0]), ElemType(1), GetRNGHandle());
+        UpdateRngOffset(GetRngOffset() + result.GetNumElements());
+        break;
+    default:
+        RuntimeError("RandomDistributionNode::ForwardProp: Unknown random distribution type code %d", m_type);
+    }
+}
+
+
+template <class ElemType>
+/*virtual*/ void RandomDistributionNode<ElemType>::BackpropTo(const size_t /*inputIndex*/, const FrameRange&) /*override*/
+{
+    /* Do nothing. The proper fix is for this Node to have it say it does not need gradient. */
+}
+
+template <class ElemType>
+/*virtual*/ bool RandomDistributionNode<ElemType>::IsOutOfDateWrtInputs() const /*override*/ { return true; }
+
+template class RandomDistributionNode<float>;
+template class RandomDistributionNode<double>;
+template class RandomDistributionNode<half>;
 
 template<class ElemType>
 void RandomSampleNodeBase<ElemType>::Validate(bool isFinalValidationPass)
@@ -35,7 +77,7 @@ void RandomSampleNodeBase<ElemType>::CopyTo(ComputationNodeBasePtr nodeP, const 
         auto node = dynamic_pointer_cast<RandomSampleNodeBase<ElemType>>(nodeP);
         node->m_allowDuplicates  = m_allowDuplicates;
         node->m_sizeOfSampledSet = m_sizeOfSampledSet;
-        node->m_randomSeed       = m_randomSeed;
+        node->SetRngState(GetRngSeed(), GetRngOffset());
     }
 }
 
@@ -45,6 +87,7 @@ void RandomSampleNodeBase<ElemType>::Save(File& fstream) const
     Base::Save(fstream);
     fstream << m_allowDuplicates;
     fstream << m_sizeOfSampledSet;
+    RngUser::Save(fstream);
 }
 
 template<class ElemType>
@@ -53,6 +96,7 @@ void RandomSampleNodeBase<ElemType>::Load(File& fstream, size_t modelVersion)
     Base::Load(fstream, modelVersion);
     fstream >> m_allowDuplicates;
     fstream >> m_sizeOfSampledSet;
+    RngUser::Load(fstream, modelVersion);
 }
 
 template<class ElemType>
@@ -65,9 +109,9 @@ void RandomSampleNodeBase<ElemType>::UpdateWeightsPrefixSum()
     {
         ElemType currentWeight = samplingWeights.GetValue(iClass, 0);
         if (currentWeight < 0)
-            InvalidArgument("Sampling weights contain negative number %f.", currentWeight);
+            InvalidArgument("Sampling weights contain negative number %f.", (float)currentWeight);
 
-        runningWeightsSum += currentWeight;
+        runningWeightsSum += (double)currentWeight;
         m_samplingWeightsPrefixSum.push_back(runningWeightsSum);
     }
 }
@@ -77,7 +121,7 @@ void RandomSampleNodeBase<ElemType>::UpdateWeightsPrefixSum()
 template<class ElemType>
 const std::vector<size_t> RandomSampleNodeBase<ElemType>::RunSampling(size_t& nTries)
 {
-    std::uniform_real_distribution<double> r(0, m_samplingWeightsPrefixSum.back());
+    boost::random::uniform_real_distribution<double> r(0, m_samplingWeightsPrefixSum.back());
     std::unordered_set<int> alreadySampled;
     std::vector<size_t> samples;
     CPURNGHandle* cpuRNGHandle = dynamic_cast<CPURNGHandle*>(&GetRNGHandle(CPUDEVICE));
@@ -88,9 +132,11 @@ const std::vector<size_t> RandomSampleNodeBase<ElemType>::RunSampling(size_t& nT
     else
         nTries = 0; // just initialize and count how many tries we need.
 
+    auto offset = GetRngOffset();
     while (samples.size() < m_sizeOfSampledSet)
     {
         double randomValue = r(cpuRNGHandle->Generator());
+        offset++;
         // Find the first index where value[idx] >= randomValue.
         auto lower = std::lower_bound(m_samplingWeightsPrefixSum.begin(), m_samplingWeightsPrefixSum.end(), randomValue);
         int idx = (int)(lower - m_samplingWeightsPrefixSum.begin());
@@ -115,6 +161,7 @@ const std::vector<size_t> RandomSampleNodeBase<ElemType>::RunSampling(size_t& nT
             }
         }
     }
+    UpdateRngOffset(offset);
     return samples;
 }
 
@@ -126,7 +173,7 @@ void RandomSampleNode<ElemType>::ForwardPropNonLooping()
     if (ValueAsMatrix().GetMatrixType() != SPARSE)
     {
         // BUGBUG: matrix type should be configured during validation
-        // We should allocate a new one instead of switching the type in place since switching in place may
+        // Note: We allocate a new one instead of switching the type in place since switching in place may
         // affect other nodes who share this matrix due to memory sharing
         auto newSparseValueMatrix = std::make_shared<Matrix<ElemType>>(ValueAsMatrix().GetNumRows(), ValueAsMatrix().GetNumCols(), CPUDEVICE, SPARSE, matrixFormatSparseCSC);
 #ifdef _MSC_VER
@@ -140,10 +187,7 @@ void RandomSampleNode<ElemType>::ForwardPropNonLooping()
 
     // TODO: Should we prepare the CSC data directly on the CPU and move it in one go?
     // Currently the reader will place the data onto the GPU. It will then be pulled on-demand to the CPU once (and cached there).
-    valueMatrix.TransferToDeviceIfNotThere(CPUDEVICE, /*ismoved =*/ true/*means: BOTH state not ok */, /*emptyTransfer =*/ true, /*updatePreferredDevice =*/ false);
-
-    // BUGUBUG: This is a no-op; was the intent to change the preferred device to CPU?
-    valueMatrix.SetDevice(CPUDEVICE);
+    valueMatrix.TransferToDeviceIfNotThere(CPUDEVICE, /*ismoved =*/ true/*means: BOTH state not ok */, /*emptyTransfer =*/ true, /*updatePreferredDevice =*/ true);
     valueMatrix.Reset();
 
     // Get vector with indices of randomly sampled classes
@@ -188,6 +232,7 @@ bool RandomSampleNode<ElemType>::IsOutOfDateWrtInputs() const
 
 template class RandomSampleNode<float>;
 template class RandomSampleNode<double>;
+template class RandomSampleNode<half>;
 
 template<class ElemType>
 double RandomSampleInclusionFrequencyNode<ElemType>::EstimateNumberOfTries()
@@ -204,7 +249,7 @@ double RandomSampleInclusionFrequencyNode<ElemType>::EstimateNumberOfTries()
     return totalTries / (double)numExperiments;
 }
 
-// Estimates the expected number of occurences of each class in the sampled set.
+// Estimates the expected number of occurrences of each class in the sampled set.
 // For sampling without replacement we use estimate using average number of tries. (Inspired by TensorFlow)
 // BUGBUG: Consider to reimplement using a less biased estimate as proposed by Nikos.
 template<class ElemType>
@@ -260,4 +305,44 @@ void RandomSampleInclusionFrequencyNode<ElemType>::Validate(bool isFinalValidati
 
 template class RandomSampleInclusionFrequencyNode<float>;
 template class RandomSampleInclusionFrequencyNode<double>;
+template class RandomSampleInclusionFrequencyNode<half>;
+
+template<class ElemType>
+void DropoutNode<ElemType>::Save(File& fstream) const
+{
+    Base::Save(fstream);
+    RngUser::Save(fstream);
+}
+
+template<class ElemType>
+void DropoutNode<ElemType>::Load(File& fstream, size_t modelVersion)
+{
+    Base::Load(fstream, modelVersion);
+    RngUser::Load(fstream, modelVersion);
+}
+
+#if 0 // outdated version
+template<class ElemType>
+void BatchNormalizationNode<ElemType>::AttachInputs(const std::vector<ComputationNodeBasePtr>& inputs)
+{
+    Base::AttachInputs(inputs);
+
+    if (m_pre19SampleCount != 0)
+    {
+        // copy the sample count loaded from a pre-cntk-19 model into the input parameter.
+        Input(RUN_COUNT)->Value().SetValue(ElemType(m_pre19SampleCount));
+        // reset the legacy sample count.
+        m_pre19SampleCount = 0;
+    }
+}
+#endif
+
+template class DropoutNode<float>;
+template class DropoutNode<double>;
+template class DropoutNode<half>;
+
+template class BatchNormalizationNode<float>;
+template class BatchNormalizationNode<double>;
+template class BatchNormalizationNode<half>;
+
 }}}

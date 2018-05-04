@@ -10,104 +10,153 @@
 #define __STDC_FORMAT_MACROS
 #include <inttypes.h>
 #include "SequencePacker.h"
-#include "ElementTypeUtils.h"
+#include "ReaderUtil.h"
 
-namespace Microsoft { namespace MSR { namespace CNTK {
+namespace CNTK {
 
-MBLayoutPtr SequencePacker::CreateMBLayout(const StreamBatch& batch)
+using namespace Microsoft::MSR::CNTK;
+
+std::pair<vector<MBLayout::SequenceInfo>, size_t> SequencePacker::CreateSequenceInfos(const StreamBatch& batch)
 {
     vector<MBLayout::SequenceInfo> infos;
+    size_t maxNumSteps = 0;
     for (size_t index = 0; index < batch.size(); ++index)
     {
         MBLayout::SequenceInfo info;
 
         info.seqId = index;
         info.tBegin = 0;
+        info.s = index;
         info.tEnd = batch[index]->m_numberOfSamples;
         infos.push_back(info);
-    }
 
+        maxNumSteps = std::max(maxNumSteps, info.tEnd);
+    }
+    return std::make_pair(infos, maxNumSteps);
+}
+
+MBLayoutPtr SequencePacker::CreateMBLayout(const StreamBatch& batch)
+{
+    auto infos = CreateSequenceInfos(batch);
+    MBLayoutPtr pMBLayout = make_shared<MBLayout>();
     vector<pair<size_t, size_t>> placement;
     vector<size_t> rowAllocations;
-
-    // Creating the minibatch layout.
-    MBLayoutPtr pMBLayout = make_shared<MBLayout>();
-    pMBLayout->InitAsPackedSequences(infos, placement, rowAllocations);
+    pMBLayout->InitAsPackedSequences(infos.first, placement, rowAllocations);
     return pMBLayout;
+}
+
+MBLayoutPtr SequencePacker::CreateBinaryMBLayout(const StreamBatch& batch)
+{
+    auto infos = CreateSequenceInfos(batch);
+    auto layout = make_shared<MBLayout>();
+    layout->Init(infos.first.size(), infos.second, false);
+    for (const auto& info : infos.first)
+        layout->AddSequence(info, false);
+    return layout;
 }
 
 Minibatch SequencePacker::ReadMinibatch()
 {
-    auto sequences = m_sequenceEnumerator->GetNextSequences(m_minibatchSize);
+    auto sequences = m_sequenceEnumerator->GetNextSequences(m_globalMinibatchSizeInSamples, m_localMinibatchSizeInSamples);
     const auto& batch = sequences.m_data;
 
-    Minibatch minibatch(sequences.m_endOfEpoch);
+    Minibatch minibatch(sequences.m_endOfSweep, sequences.m_endOfEpoch);
     if (batch.empty())
-    {
         return minibatch;
-    }
 
     auto& currentBuffer = m_streamBuffers[m_currentBufferIndex];
 
     assert(m_outputStreamDescriptions.size() == batch.size());
-
     for (int streamIndex = 0; streamIndex < batch.size(); ++streamIndex)
     {
         const auto& streamBatch = batch[streamIndex];
 
         if (m_checkSampleShape[streamIndex])
         {
-            CheckSampleShape(streamBatch, m_outputStreamDescriptions[streamIndex]);
+            RefreshSampleShape(streamBatch, m_outputStreamDescriptions[streamIndex]);
         }
 
-        const auto& type = m_outputStreamDescriptions[streamIndex]->m_storageType;
-        auto pMBLayout = (type == StorageType::dense) ?
-            PackDenseStream(streamBatch, streamIndex) : PackSparseStream(streamBatch, streamIndex);
+        const auto& type = m_outputStreamDescriptions[streamIndex].m_storageFormat;
+        auto isBinary = m_inputStreamDescriptions[streamIndex].m_isBinary;
+
+        MBLayoutPtr pMBLayout = nullptr;
+        if (isBinary)
+            pMBLayout = PackBinaryStream(streamBatch, streamIndex);
+        else if (type == StorageFormat::Dense)
+            pMBLayout = PackDenseStream(streamBatch, streamIndex);
+        else if (type == StorageFormat::SparseCSC)
+            pMBLayout = PackSparseStream(streamBatch, streamIndex);
+        else
+            RuntimeError("Unsupported for packing type '%d'", (int)type);
 
         auto& buffer = currentBuffer[streamIndex];
 
         auto streamMinibatch = std::make_shared<StreamMinibatch>();
         streamMinibatch->m_data = buffer.m_data.get();
         streamMinibatch->m_layout = pMBLayout;
+        streamMinibatch->m_sampleShape = m_outputStreamDescriptions[streamIndex].m_sampleLayout;
+
         minibatch.m_data.push_back(streamMinibatch);
     }
+
+    EstablishIdToKey(minibatch, sequences);
 
     m_currentBufferIndex = (m_currentBufferIndex + 1) % m_numberOfBuffers;
     return minibatch;
 }
 
-void SequencePacker::CheckSampleShape(const std::vector<SequenceDataPtr>& minibatch, StreamDescriptionPtr outputStream)
+void SequencePacker::SetConfiguration(const ReaderConfiguration& config, const std::vector<MemoryProviderPtr>& memoryProviders)
+{
+    PackerBase::SetConfiguration(config, memoryProviders);
+
+    if (m_useLocalTimeline)
+    {
+        // Set global minibatch size to max and local minibatch per worker.
+        bool shouldAddOneSample = (int)m_config.m_minibatchSizeInSamples % m_config.m_numberOfWorkers > m_config.m_workerRank;
+        m_localMinibatchSizeInSamples = (int)m_config.m_minibatchSizeInSamples / (int)m_config.m_numberOfWorkers + (shouldAddOneSample ? 1 : 0);
+        m_globalMinibatchSizeInSamples = SIZE_MAX;
+
+        if (m_localMinibatchSizeInSamples == 0)
+        {
+            // We expect to have a least a single sample per worker.
+            fprintf(stderr, "WARNING: The minibatch size '%" PRIu64 "' is too small to be used with %d workers, adjusting to minibatch size of 1 sample per worker\n",
+                m_config.m_minibatchSizeInSamples,
+                (int)m_config.m_numberOfWorkers);
+            m_localMinibatchSizeInSamples = 1;
+        }
+    }
+    else
+    {
+        // Set global and minibatch local minibatch size as in config.
+        m_globalMinibatchSizeInSamples = m_localMinibatchSizeInSamples = m_config.m_minibatchSizeInSamples;
+    }
+}
+
+void SequencePacker::RefreshSampleShape(const std::vector<SequenceDataPtr>& minibatch, StreamInformation& outputStream)
 {
     assert(!minibatch.empty());
 
-    // TODO: This should come from the network - layout that network expects.
-    // TODO: In this case we can make outputStream const.
-    // Currently it is not coming from SGD/Network, so we assume the first one is correct.
-    if (outputStream->m_sampleLayout == nullptr)
-    {
-        outputStream->m_sampleLayout = minibatch.front()->m_sampleLayout;
-    }
+    if (outputStream.m_sampleLayout.IsUnknown() && !minibatch.front()->GetSampleShape().IsUnknown())
+        outputStream.m_sampleLayout = minibatch.front()->GetSampleShape();
+
+    if (outputStream.m_sampleLayout.IsUnknown())
+        LogicError("Unknown shape of the sequence in stream '%ls'.", outputStream.m_name.c_str());
 
     for (const auto& s : minibatch)
     {
-        if (s->m_sampleLayout == nullptr)
-        {
-            LogicError("Unknown shape of the sequence in stream '%ls'.", outputStream->m_name.c_str());
-        }
-
-        if (*s->m_sampleLayout != *outputStream->m_sampleLayout)
+        if (s->GetSampleShape() != outputStream.m_sampleLayout)
         {
             RuntimeError("Packer currently does not support samples with varying shapes."
                 "Please make sure there is a transform that unifies the shape of samples for input stream '%ls' "
                 "or the deserializer provides samples with the same shape.",
-                outputStream->m_name.c_str());
+                outputStream.m_name.c_str());
         }
     }
 }
 
 MBLayoutPtr SequencePacker::PackDenseStream(const StreamBatch& batch, size_t streamIndex)
 {
-    assert(m_outputStreamDescriptions[streamIndex]->m_storageType == StorageType::dense);
+    assert(m_outputStreamDescriptions[streamIndex].m_storageFormat == StorageFormat::Dense);
     const auto& stream = m_inputStreamDescriptions[streamIndex];
     auto& buffer = m_streamBuffers[m_currentBufferIndex][streamIndex];
     size_t sampleSize = GetSampleSize(m_outputStreamDescriptions[streamIndex]);
@@ -118,7 +167,7 @@ MBLayoutPtr SequencePacker::PackDenseStream(const StreamBatch& batch, size_t str
         buffer.Resize(requiredSize);
     }
 
-    auto elementSize = GetSizeByType(stream->m_elementType);
+    auto elementSize = DataTypeSize(stream.m_elementType);
 
     const auto& sequenceInfos = pMBLayout->GetAllSequences();
 
@@ -148,14 +197,14 @@ MBLayoutPtr SequencePacker::PackDenseStream(const StreamBatch& batch, size_t str
             // verify that there's enough space left in the buffer to fit a full sample.
             assert(destinationOffset <= buffer.m_size - sampleSize);
             auto* destination = bufferPtr + destinationOffset;
-            if (stream->m_storageType == StorageType::dense)
+            if (stream.m_storageFormat == StorageFormat::Dense)
             {
                 // verify that the offset (an invariant for dense).
                 assert(sampleOffset == sampleIndex * sampleSize);
                 PackDenseSample(destination, sequence, sampleOffset, sampleSize);
                 sampleOffset += sampleSize;
             }
-            else if (stream->m_storageType == StorageType::sparse_csc)
+            else if (stream.m_storageFormat == StorageFormat::SparseCSC)
             {
                 // TODO: make type casts members of the SparseSequenceData
                 SparseSequenceDataPtr sparseSequence = static_pointer_cast<SparseSequenceData>(sequence);
@@ -170,7 +219,7 @@ MBLayoutPtr SequencePacker::PackDenseStream(const StreamBatch& batch, size_t str
             }
             else
             {
-                RuntimeError("Storage type %d is not supported.", (int)stream->m_storageType);
+                RuntimeError("Storage type %d is not supported.", (int)stream.m_storageFormat);
             }
         }
     }
@@ -180,7 +229,7 @@ MBLayoutPtr SequencePacker::PackDenseStream(const StreamBatch& batch, size_t str
 
 MBLayoutPtr SequencePacker::PackSparseStream(const StreamBatch& batch, size_t streamIndex)
 {
-    assert(m_outputStreamDescriptions[streamIndex]->m_storageType == StorageType::sparse_csc);
+    assert(m_outputStreamDescriptions[streamIndex].m_storageFormat == StorageFormat::SparseCSC);
 
     // compute the aggregate nnz count of all the sequence in the batch.
     size_t nnzCount = 0;
@@ -197,8 +246,8 @@ MBLayoutPtr SequencePacker::PackSparseStream(const StreamBatch& batch, size_t st
     }
 
     const auto& stream = m_inputStreamDescriptions[streamIndex];
-    assert(stream->m_storageType == StorageType::sparse_csc);
-    auto elementSize = GetSizeByType(stream->m_elementType);
+    assert(stream.m_storageFormat == StorageFormat::SparseCSC);
+    auto elementSize = DataTypeSize(stream.m_elementType);
     auto indexSize = sizeof(IndexType);
     auto pMBLayout = CreateMBLayout(batch);
 
@@ -221,7 +270,7 @@ MBLayoutPtr SequencePacker::PackSparseStream(const StreamBatch& batch, size_t st
     memcpy(destination, &nnzCount, sizeof(nnzCount));
 
     // create two pointers to the memory blocks inside the buffer,
-    // one for data portion and anther -- for indices.
+    // one for data portion and another -- for indices.
     auto* dataDst = destination + sizeof(nnzCount);
     auto* indicesDst = dataDst + elementSize* nnzCount;
     // column index for the current sample (= number of nnz value packed so far).
@@ -265,7 +314,7 @@ MBLayoutPtr SequencePacker::PackSparseStream(const StreamBatch& batch, size_t st
             // compute the index of the sample inside the sequence.
             size_t sampleIndex = timeStep - sequenceInfo.tBegin;
             const auto& sequence = batch[seqId];
-            
+
             // make sure the index less than the sequence length in samples.
             assert(sampleIndex < sequence->m_numberOfSamples);
 
@@ -312,4 +361,46 @@ MBLayoutPtr SequencePacker::PackSparseStream(const StreamBatch& batch, size_t st
     return pMBLayout;
 }
 
-}}}
+MBLayoutPtr SequencePacker::PackBinaryStream(const StreamBatch& batch, size_t streamIndex)
+{
+    // In binary stream each sequence is an array chars. Currently we pack them as floats.
+    if (m_outputStreamDescriptions[streamIndex].m_storageFormat != StorageFormat::Dense ||
+        m_inputStreamDescriptions[streamIndex].m_storageFormat != StorageFormat::Dense)
+        RuntimeError("Binary streams can only be of dense storage format.");
+
+    const auto& stream = m_inputStreamDescriptions[streamIndex];
+    auto& buffer = m_streamBuffers[m_currentBufferIndex][streamIndex];
+    size_t sampleSize = GetSampleSize(m_inputStreamDescriptions[streamIndex]);
+
+    auto pMBLayout = CreateBinaryMBLayout(batch);
+    size_t requiredSize = pMBLayout->GetNumCols() * sampleSize;
+
+    if (buffer.m_size < requiredSize)
+        buffer.Resize(requiredSize);
+
+    auto elementSize = DataTypeSize(stream.m_elementType);
+    const auto& sequenceInfos = pMBLayout->GetAllSequences();
+
+    // Iterate over sequences in the layout, copy samples from the
+    // source sequences into the buffer (at appropriate offsets).
+    for (int i = 0; i < sequenceInfos.size(); ++i)
+    {
+        const auto& sequenceInfo = sequenceInfos[i];
+        if (sequenceInfo.seqId == GAP_SEQUENCE_ID) // skip gaps
+            continue;
+
+        const auto& sequence = batch[sequenceInfo.seqId];
+        size_t numSamples = sequence->m_numberOfSamples;
+        assert(numSamples == sequenceInfo.GetNumTimeSteps());
+
+        char* bufferPtr = buffer.m_data.get();
+        auto destinationOffset = i * pMBLayout->GetNumTimeSteps() * elementSize;
+
+        auto source = (const char*)(sequence->GetDataBuffer());
+        std::copy(source, source + numSamples * elementSize, bufferPtr + destinationOffset);
+    }
+    return pMBLayout;
+}
+
+
+}

@@ -1,5 +1,9 @@
 # CNTK Examples: Image/Classification/ResNet
 
+> Note: if, on Linux, you experience segmentation faults when trying to run these examples,
+> please increase your stack size limit. This can be done by running `ulimit -s 65536` in your shell,
+> and then running CNTK from the same session. You can also check you current limits using `ulimit -a`.
+
 ## BrainScript
 
 ### ResNet20_CIFAR10.cntk
@@ -11,7 +15,7 @@ We use a fixed crop ratio of `0.8` and scale the image to `32x32` pixels for tra
 
 `cntk configFile=ResNet20_CIFAR10.cntk`
 
-The network achieves an error rate of about `8.2%`, which is lower than the number reported in the original paper.
+The network achieves an error rate of about `8.580%`, which is lower than the number reported in the original paper.
 
 ### ResNet110_CIFAR10.cntk
 
@@ -19,7 +23,7 @@ In this example we increase the depth of the ResNet to 110 layers. That is, we s
 
 `cntk configFile=ResNet110_CIFAR10.cntk`
 
-The network achieves an error rate of about `6.3%`.
+The network achieves an error rate of about `6.180%`.
 
 ### ResNet50_ImageNet1K.cntk
 

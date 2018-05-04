@@ -20,7 +20,9 @@
 using namespace msra::cuda;
 
 #ifndef CPUONLY
-#pragma comment(lib, "MathCUDA.lib") // built by CNTKMathCUDA project
+#define ANAMEFORLIB "Cntk.Math.Cuda-" ## CNTK_COMPONENT_VERSION ## ".lib"
+#pragma comment(lib, ANAMEFORLIB) // built by CNTKMathCUDA project
+#undef ANAMEFORLIB
 #endif
 
 namespace msra { namespace lattices {
@@ -253,8 +255,8 @@ static double emulateforwardbackwardlattice(const size_t* batchsizeforward, cons
     size_t startindex = 0;
     for (size_t i = 0; i < numlaunchforward; i++)
     {
-        dim3 b((unsigned int) ((batchsizeforward[i] + tpb - 1) / tpb));
-        emulatecuda(b, t, [&]()
+        dim3 b2((unsigned int) ((batchsizeforward[i] + tpb - 1) / tpb));
+        emulatecuda(b2, t, [&]()
                     {
                         forwardlatticej(batchsizeforward[i], startindex, edgeacscores, spalignunitid, silalignunitid, edges, nodes, aligns, alignments, alignoffsets,
                                         logalphas, lmf, wp, amf, boostingfactor, uids, senone2classmap, returnEframescorrect, logframescorrectedge, logaccalphas);
@@ -273,8 +275,8 @@ static double emulateforwardbackwardlattice(const size_t* batchsizeforward, cons
     startindex = edges.size();
     for (size_t i = 0; i < numlaunchbackward; i++)
     {
-        dim3 b((unsigned int) ((batchsizebackward[i] + tpb - 1) / tpb));
-        emulatecuda(b, t, [&]()
+        dim3 b3((unsigned int) ((batchsizebackward[i] + tpb - 1) / tpb));
+        emulatecuda(b3, t, [&]()
                     {
                         backwardlatticej(batchsizebackward[i], startindex - batchsizebackward[i], edgeacscores,
                                          spalignunitid, silalignunitid, edges, nodes, aligns,
@@ -735,6 +737,11 @@ void lattice::parallelstate::setloglls(const Microsoft::MSR::CNTK::Matrix<double
     throw ::logic_error("Double precision not supported for sequence training");
 }
 
+void lattice::parallelstate::setloglls(const Microsoft::MSR::CNTK::Matrix<half>& /*loglls*/)
+{
+    throw ::logic_error("Half precision not supported for sequence training");
+}
+
 void lattice::parallelstate::getgamma(Microsoft::MSR::CNTK::Matrix<float>& loglls)
 {
     pimpl->getgamma(loglls);
@@ -742,6 +749,11 @@ void lattice::parallelstate::getgamma(Microsoft::MSR::CNTK::Matrix<float>& logll
 
 // TODO: Overload to enable compilation for DoublePrecision though its currently unsupported
 void lattice::parallelstate::getgamma(Microsoft::MSR::CNTK::Matrix<double>& /*loglls*/)
+{
+    throw ::logic_error("Double precision not supported for sequence training");
+}
+
+void lattice::parallelstate::getgamma(Microsoft::MSR::CNTK::Matrix<half>& /*loglls*/)
 {
     throw ::logic_error("Double precision not supported for sequence training");
 }

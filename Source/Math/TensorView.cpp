@@ -285,6 +285,23 @@ void TensorView<ElemType>::DoTernaryOpOf(ElemType beta, const TensorView& a, con
     GetSOB().TensorOp(beta, a.GetSOB(), b.GetSOB(), c.GetSOB(), alpha, op, reductionOp, offsets, regularOpDims, regularStrides, reducingOpDims, reducingStrides);
 }
 
+template <class ElemType>
+void TensorView<ElemType>::DoArgReductionOpOf(const TensorView& a, ElementWiseOperator reductionOp)
+{
+    // prepare all tensor descriptor information as needed for execution
+    array<size_t, 2> offsets;
+    array<SmallVector<ptrdiff_t>, 2> regularStrides, reducingStrides;
+    SmallVector<size_t> regularOpDims, reducingOpDims;
+    PrepareTensorOperands<ElemType, 2>(array<TensorShape, 2>{a.GetShape(), GetShape()}, offsets, regularOpDims, regularStrides, reducingOpDims, reducingStrides);
+
+    // output cannot be input when reducing
+    if (reducingOpDims.size() > 0)
+        CheckDifferentObject(a, *this);
+
+    // now perform the operation
+    GetSOB().TensorArgOp(a.GetSOB(), reductionOp, offsets, regularOpDims, regularStrides, reducingOpDims, reducingStrides);
+}
+
 // -------------------------------------------------------------------
 // matrix product -- GEMM for flattened tensors
 // -------------------------------------------------------------------
@@ -352,7 +369,7 @@ shared_ptr<Matrix<ElemType>> TensorView<ElemType>::AsMatrix() const
 }
 
 template <class ElemType>
-void TensorView<ElemType>::DoMatrixProductOf(ElemType beta, bool transC, const TensorView& a, bool transA, const TensorView& b, bool transB, ElemType alpha)
+void TensorView<ElemType>::DoMatrixProductOf(ElemType beta, bool transC, const TensorView& a, bool transA, const TensorView& b, bool transB, ElemType alpha, shared_ptr<QuantizedMultiplier<ElemType>> pQuantizedMultiplier)
 {
     // determine integration dimension offset
     auto shapeA = a.m_shape;
@@ -383,12 +400,20 @@ void TensorView<ElemType>::DoMatrixProductOf(ElemType beta, bool transC, const T
     auto C =   Reshaped(shapeC).AsMatrix();
     // and go
     if (!transC)
-        Matrix<ElemType>::MultiplyAndWeightedAdd(alpha, *A, transA, *B, transB, beta, *C);
+        Matrix<ElemType>::MultiplyAndWeightedAdd(alpha, *A, transA, *B, transB, beta, *C, pQuantizedMultiplier);
     else // C' = A * B  <==>  C = (A * B)' = B' * A'
-        Matrix<ElemType>::MultiplyAndWeightedAdd(alpha, *B, !transB, *A, !transA, beta, *C);
+        Matrix<ElemType>::MultiplyAndWeightedAdd(alpha, *B, !transB, *A, !transA, beta, *C, pQuantizedMultiplier);
 }
 
 template class TensorView<float>;
 template class TensorView<double>;
+template class TensorView<half>;
+
+template Microsoft::MSR::CNTK::TensorView<char>::TensorView(const MatrixBasePtr& sob, const TensorShape& shape);
+template Microsoft::MSR::CNTK::TensorView<char>::TensorView(const TensorView<char>& other, const TensorShape& shape);
+template Microsoft::MSR::CNTK::TensorView<char>::TensorView(const TensorView<char>& other);
+template Microsoft::MSR::CNTK::TensorView<char> Microsoft::MSR::CNTK::TensorView<char>::Reshaped(const TensorShape& shape) const;
+template shared_ptr<Matrix<char>> Microsoft::MSR::CNTK::TensorView<char>::AsMatrix() const;
+template const TensorShape& Microsoft::MSR::CNTK::TensorView<char>::GetShape() const;
 
 }}}

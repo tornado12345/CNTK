@@ -427,7 +427,7 @@ public:
 
     const ConfigValuePtr &ResolveValue() const // (this is const but mutates the value if it resolves)
     {
-        // call this when a a member might be as-of-yet unresolved, to evaluate it on-demand
+        // call this when a member might be as-of-yet unresolved, to evaluate it on-demand
         // get() is a pointer to a Thunk in that case, that is, a function object that yields the value
         const auto thunkp = GetThunk(); // is it a Thunk?
         if (thunkp)                     // value is a Thunk: we need to resolve
@@ -668,7 +668,10 @@ public:
         {
             valp.ResolveValue(); // resolve upon access
             if (!flatten || !valp.Is<ConfigArray>())
-                res.push_back(valp);
+            {
+                const C &type = valp;
+                res.push_back(type);
+            }
             else // special case: flatten nested vectors (only if 'flatten')
             {
                 std::vector<C> subVector = valp.AsRef<ConfigArray>().AsVector<C>(Fail, flatten);
@@ -730,11 +733,11 @@ public:
             const auto valuei = namedArgs.find(id); // was such parameter passed?
             if (valuei == namedArgs.end())          // named parameter not passed
             {                                       // if not given then fall back to default
-                auto f = [&namedParam]()            // we pass a lambda that resolves it upon first use, in our original location
+                auto f2 = [&namedParam]()            // we pass a lambda that resolves it upon first use, in our original location
                 {
                     return namedParam.second.ResolveValue();
                 };
-                actualNamedArgs[id] = move(ConfigValuePtr::MakeThunk(f, namedParam.second.GetFailFn(), exprName));
+                actualNamedArgs[id] = move(ConfigValuePtr::MakeThunk(f2, namedParam.second.GetFailFn(), exprName));
             }
             else                                            // named parameter was passed
                 actualNamedArgs[id] = move(valuei->second); // move it, possibly remaining unresolved
