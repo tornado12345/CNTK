@@ -25,37 +25,43 @@ message NDArrayView {
     Double = 2;
     Float16 = 4;
     Int8 = 5;
+    Int16 = 6;
   }
-  
+
   enum StorageFormat {
     Dense = 0;
     SparseCSC = 1;
     SparseBlockCol = 2;
   }
-  
+
   DataType data_type = 1;
   StorageFormat storage_format = 2;
   NDShape shape = 3;
-  
+
   message FloatValues {
     repeated float value = 1 [packed = true];
   }
-  
+
   message DoubleValues {
     repeated double value = 1 [packed = true];
   }
 
-    message IntValues {
+  message BytesValue {
+    bytes value = 1;
+  }
+
+  message IntValues {
     repeated sint32 value = 1 [packed = true];
   }
 
   oneof values {
     FloatValues float_values = 4;
     DoubleValues double_values = 5;
-    IntValues sint32_values = 6;
+    BytesValue bytes_value = 6;
+    IntValues sint32_values = 7;
   }
 
-  // TODO: bool read_only = 7;
+  // TODO: bool read_only = 8;
 }
 
 message Vector {

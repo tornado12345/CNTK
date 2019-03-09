@@ -1,35 +1,18 @@
 # CNTK Current Iteration
 
-## Efficient group convolution
-The implementation of group convolution in CNTK has been updated. The updated implementation moves away from creating a sub-graph for group convolution (using slicing and splicing), and instead uses cuDNN7 and MKL2017 APIs directly. This improves the experience both in terms of performance and model size. 
+## Highlights of this release
+* Moved to CUDA 10 for both Windows and Linux.
+* Support advance RNN loop in ONNX export.
 
-As an example, for a single group convolution op with the following attributes:
+## CNTK support for CUDA 10
 
-- Input tensor (C, H, W) = (32, 128, 128)
-- Number of output channels = 32 (channel multiplier is 1)
-- Groups = 32 (depth wise convolution)
-- Kernel size = (5, 5)
+CNTK now supports CUDA 10. This requires an update to build environment to Visual Studio 2017 v15.9 for Windows.
 
-The comparison numbers for this single node are as follows:
+To setup build and runtime environment on Windows:
+* Install [Visual Studio 2017](https://www.visualstudio.com/downloads/). Note: going forward for CUDA 10 and beyond, it is no longer required to install and run with the specific VC Tools version 14.11.
+* Install [Nvidia CUDA 10](https://developer.nvidia.com/cuda-downloads?target_os=Windows&target_arch=x86_64)
+* From PowerShell, run:
+    [DevInstall.ps1](../Tools/devInstall/Windows/DevInstall.ps1)
+* Start Visual Studio 2017 and open [CNTK.sln](./CNTK.sln).
 
-| First Header  | GPU exec. time (in millisec., 1000 run avg.) | CPU exec. time (in millisec., 1000 run avg.) | Model Size (in KB, CNTK format)
-| ------------- | ------------- | ------------- | ------------- |
-| Old implementation  | 9.349  | 41.921  | 38  |
-| New implementation  | 6.581  | 9.963  | 5  |
-| Speedup/savings	Approx.  | 30%	Approx.  | 65-75%	Approx.  | 87% |
-
-## Operators
-
-
-## Bug fixes
-
-
-## ONNX
-### Updates
-- Updated CNTK's ONNX BatchNormalization op export/import to latest spec.
-
-### Bug or minor fixes:
-
-
-## Misc
-
+To setup build and runtime environment on Linux using docker, please build Unbuntu 16.04 docker image using Dockerfiles [here](./Tools/docker). For other Linux systems, please refer to the Dockerfiles to setup dependent libraries for CNTK.

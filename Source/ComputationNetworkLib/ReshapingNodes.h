@@ -314,7 +314,15 @@ public:
 
     virtual ParentGradientOptimization ImplementsGradientOptimization(const ComputationNodeBase*) const override
     {
-        return ParentGradientOptimization::Overwrite;
+        switch (m_reductionOp)
+        {
+        case ElementWiseOperator::opArgmin:
+        case ElementWiseOperator::opArgmax:
+            //no optimization will happen; the child should not use the parent's gradients as no gradients will be passed
+            return ParentGradientOptimization::None;
+        default:
+            return ParentGradientOptimization::Overwrite;
+        }
     }
 
     void RequestMatricesBeforeForwardProp(MatrixPool& matrixPool) override
@@ -2101,7 +2109,15 @@ public:
                 row_elements *= dims[i];
             }
 
-            sourceGradient.ScatterToIndices(outputGradient, indices, row_elements);
+            if (InputRef(0).HasMBLayout())
+            {
+                const auto& indicesMask = InputRef(0).GetMBLayout()->GetColumnsValidityMask(indices.GetDeviceId());
+                sourceGradient.ScatterToIndices(outputGradient, indices, row_elements, &indicesMask);
+            }
+            else
+            {
+                sourceGradient.ScatterToIndices(outputGradient, indices, row_elements);
+            }
         }
         else
         {

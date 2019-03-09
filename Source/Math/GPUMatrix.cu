@@ -472,10 +472,14 @@ void GPUMatrix<ElemType>::performElementWiseFunction(ElementWiseOperator kind, c
         return _elementWiseCosineOnCuda<ElemType><<<blocksPerGrid, GridDim::maxThreadsPerBlock, 0, t_stream>>>(src, Data(), N);
     case ElementWiseOperator::opNegativeSine:
         return _elementWiseNegativeSineOnCuda<ElemType><<<blocksPerGrid, GridDim::maxThreadsPerBlock, 0, t_stream>>>(src, Data(), N);
+    case ElementWiseOperator::opTan:
+        return _elementWiseTanOnCuda<ElemType> << <blocksPerGrid, GridDim::maxThreadsPerBlock, 0, t_stream >> >(src, Data(), N);
     case ElementWiseOperator::opAcos:
         return _elementWiseAcosOnCuda<ElemType><<<blocksPerGrid, GridDim::maxThreadsPerBlock, 0, t_stream>>>(src, Data(), N);
     case ElementWiseOperator::opAsin:
         return _elementWiseAsinOnCuda<ElemType><<<blocksPerGrid, GridDim::maxThreadsPerBlock, 0, t_stream>>>(src, Data(), N);
+    case ElementWiseOperator::opAtan:
+        return _elementWiseAtanOnCuda<ElemType> << <blocksPerGrid, GridDim::maxThreadsPerBlock, 0, t_stream >> >(src, Data(), N);
     case ElementWiseOperator::opCosh:
         return _elementWiseCoshOnCuda<ElemType><<<blocksPerGrid, GridDim::maxThreadsPerBlock, 0, t_stream>>>(src, Data(), N);
     case ElementWiseOperator::opSinh:
@@ -1291,7 +1295,7 @@ void GPUMatrix<ElemType>::SetValue(const size_t numRows, const size_t numCols, i
 template <class ElemType>
 void GPUMatrix<ElemType>::SetDiagonalValue(const ElemType v)
 {
-    CUDA_LONG N = (CUDA_LONG) GetNumRows();
+    CUDA_LONG N = (CUDA_LONG) GetDiagSize();
     int blocksPerGrid = (int) ceil(1.0 * N / GridDim::maxThreadsPerBlock);
     PrepareDevice();
     SyncGuard syncGuard;
@@ -1304,24 +1308,21 @@ void GPUMatrix<ElemType>::SetDiagonalValue(const GPUMatrix<ElemType>& vector)
     if (IsEmpty() || vector.IsEmpty())
         LogicError("SetDiagonalValue: Matrix is empty.");
 
-    if (GetNumRows() != GetNumCols())
-        LogicError("SetDiagonalValue: NumRows and NumCols do not agree.");
-
     if (vector.GetNumRows() != 1 && vector.GetNumCols() != 1)
         LogicError("SetDiagonalValue: input vector must be a vector.");
 
     if (vector.GetNumElements() == 1) // reduce to simple form
         SetDiagonalValue(vector.Data()[0]);
 
-    else if (vector.GetNumRows() != GetNumRows() && vector.GetNumCols() != GetNumRows())
+    else if (vector.GetNumRows() != GetDiagSize() && vector.GetNumCols() != GetDiagSize())
         LogicError("SetDiagonalValue: input vector's dimension does not agree with [this].");
     else
     {
-        CUDA_LONG N = (CUDA_LONG) GetNumRows();
+        CUDA_LONG N = (CUDA_LONG) GetDiagSize();
         int blocksPerGrid = (int) ceil(1.0 * N / GridDim::maxThreadsPerBlock);
         PrepareDevice();
         SyncGuard syncGuard;
-        _setDiagonalValueFromVector<ElemType><<<blocksPerGrid, GridDim::maxThreadsPerBlock, 0, t_stream>>>(Data(), vector.Data(), N);
+        _setDiagonalValueFromVector<ElemType><<<blocksPerGrid, GridDim::maxThreadsPerBlock, 0, t_stream>>>(Data(), vector.Data(), N, (CUDA_LONG) GetNumRows());
     }
 }
 
@@ -1536,10 +1537,10 @@ void GPUMatrix<ElemType>::FSAdagrad(GPUMatrix<ElemType>& gradients,
 template <class ElemType>
 void GPUMatrix<ElemType>::Adam(GPUMatrix<ElemType>& gradients,
     GPUMatrix<ElemType>& functionValues,
-    ElemType learnRatePerSample,
-    ElemType momentum,
-    ElemType adaWeight,
-    ElemType adaMul,
+    ElemType learnRatePerSample, //alpha
+    ElemType momentum, // /beta_1 
+    ElemType adaWeight, // /beta_2
+    ElemType adaMul, //biasCorrection
     ElemType epsilon,
     ElemType unitGainFactor,
     bool adamax)
@@ -2335,11 +2336,17 @@ DEF_ELEMWISE_ASSIGN_FUNC(Cosine)
 DEF_ELEMWISE_INPLACE_FUNC(NegativeSine)
 DEF_ELEMWISE_ASSIGN_FUNC(NegativeSine)
 
+DEF_ELEMWISE_INPLACE_FUNC(Tan)
+DEF_ELEMWISE_ASSIGN_FUNC(Tan)
+
 DEF_ELEMWISE_INPLACE_FUNC(Acos)
 DEF_ELEMWISE_ASSIGN_FUNC(Acos)
 
 DEF_ELEMWISE_INPLACE_FUNC(Asin)
 DEF_ELEMWISE_ASSIGN_FUNC(Asin)
+
+DEF_ELEMWISE_INPLACE_FUNC(Atan)
+DEF_ELEMWISE_ASSIGN_FUNC(Atan)
 
 DEF_ELEMWISE_INPLACE_FUNC(Cosh)
 DEF_ELEMWISE_ASSIGN_FUNC(Cosh)
@@ -4401,6 +4408,7 @@ GPUMatrix<ElemType>& GPUMatrix<ElemType>::AssignOneHot(const GPUMatrix<ElemType>
     return *this;
 }
 
+
 template <class ElemType>
 GPUMatrix<ElemType>& GPUMatrix<ElemType>::GatherFromTarget(const GPUMatrix<ElemType>& indices, const GPUMatrix<ElemType>& target, size_t row_elements)
 {
@@ -4428,19 +4436,21 @@ GPUMatrix<ElemType>& GPUMatrix<ElemType>::GatherFromTarget(const GPUMatrix<ElemT
 }
 
 template <class ElemType>
-GPUMatrix<ElemType>& GPUMatrix<ElemType>::ScatterToIndices(const GPUMatrix<ElemType>& values, const GPUMatrix<ElemType>& indices, size_t row_elements)
+GPUMatrix<ElemType>& GPUMatrix<ElemType>::ScatterToIndices(const GPUMatrix<ElemType>& values, const GPUMatrix<ElemType>& indices, size_t row_elements, const GPUMatrix<char>* mask/*= nullptr*/)
 {
-    if (indices.IsEmpty() || values.IsEmpty())
+    if (indices.IsEmpty() || values.IsEmpty() || (mask && mask->IsEmpty()))
         LogicError("ScatterToIndices: input matrix is empty.");
 
     ElemType* indicesBufPtr = indices.Data();
     ElemType* valueBufPtr = values.Data();
+    char* maskBufPtr = mask ? mask->Data() : nullptr;
     ElemType* buffer = Data();
+    size_t num_indices_elems_per_mask_col = mask ? indices.GetNumRows() * indices.GetNumCols() / mask->GetNumCols() : 0;
 
     size_t num_indices = indices.GetNumElements();
     CUDA_LONG N = (CUDA_LONG)num_indices * row_elements;
     int blocksPerGrid = (int)ceil(((double)N) / GridDim::maxThreadsPerBlock);
-    _scatterToIndices<ElemType> << <blocksPerGrid, GridDim::maxThreadsPerBlock >> > (indicesBufPtr, valueBufPtr, buffer, row_elements, num_indices, N);
+    _scatterToIndices<ElemType> << <blocksPerGrid, GridDim::maxThreadsPerBlock >> > (indicesBufPtr, valueBufPtr, buffer, maskBufPtr, num_indices_elems_per_mask_col, row_elements, num_indices, N);
 
     return *this;
 }
@@ -5047,6 +5057,10 @@ template void GPUMatrix<short>::CopySection(size_t numRows, size_t numCols, shor
 template void GPUMatrix<short>::Reshape(const size_t, const size_t);
 template GPUMatrix<short>& GPUMatrix<short>::operator*=(short);
 template DEVICEID_TYPE GPUMatrix<short>::PrepareDevice(DEVICEID_TYPE deviceId) const;
+template void GPUMatrix<short>::SetUniformRandomValue(const short low, const short high, unsigned long seed);
+template void GPUMatrix<short>::SetUniformRandomValue(RNGHandle& rngHandle, const short low, const short high);
+template void GPUMatrix<short>::SetGaussianRandomValue(const short mean, const short sigma, unsigned long seed);
+template void GPUMatrix<short>::SetGaussianRandomValue(RNGHandle& rngHandle, const short mean, const short stdev);
 
 template GPUMatrix<int>::GPUMatrix(const size_t, const size_t, int, int*, const size_t);
 template GPUMatrix<int>::~GPUMatrix();

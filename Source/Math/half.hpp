@@ -11,7 +11,10 @@
 #include "../CNTKv2LibraryDll/API/HalfConverter.hpp"
 
 #if !defined(CPUONLY) && __has_include("cuda_fp16.h")
-#include <cuda_fp16.h> // ASSUME CUDA9
+
+#pragma warning(disable : 4505) // 'function' : unreferenced local function has been removed
+
+#include <cuda_fp16.h> // ASSUME CUDA10
 #else
 class alignas(2) __half
 {
@@ -305,8 +308,10 @@ STD_HALF_UNIOP(log)
 STD_HALF_UNIOP(log10)
 STD_HALF_UNIOP(cos)
 STD_HALF_UNIOP(sin)
+STD_HALF_UNIOP(tan)
 STD_HALF_UNIOP(acos)
 STD_HALF_UNIOP(asin)
+STD_HALF_UNIOP(atan)
 STD_HALF_UNIOP(cosh)
 STD_HALF_UNIOP(sinh)
 STD_HALF_UNIOP(acosh)
