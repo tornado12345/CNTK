@@ -92,11 +92,11 @@ void ONNXFormat::InitializeLotusIR()
     });
 }
 
-void ONNXFormat::Save(const FunctionPtr& src, const std::wstring& filepath)
+void ONNXFormat::Save(const FunctionPtr& src, const std::wstring& filepath, bool useExternalFilesToStoreParameters)
 {
     InitializeLotusIR();
 
-    auto model = CNTKToONNX::CreateModel(src);
+    auto model = CNTKToONNX::CreateModel(src, filepath, useExternalFilesToStoreParameters);
 #ifdef _WIN32
     onnxruntime::Model::Save(*model, filepath);
 #else
@@ -115,6 +115,26 @@ FunctionPtr ONNXFormat::Load(const std::wstring& filepath, const DeviceDescripto
 #else
     onnxruntime::common::Status loadStatus = onnxruntime::Model::Load(ToLegacyString(ToUTF8(filepath)), model);
 #endif
+    if (!loadStatus.IsOK())
+        LogicError("Failed to load model: '%s'", loadStatus.ErrorMessage().c_str());
+
+    FunctionPtr cntkFunction = ONNXToCNTK::CreateGraph(&model->MainGraph(), computeDevice, ToLegacyString(ToUTF8(filepath)));
+    return cntkFunction;
+}
+
+FunctionPtr ONNXFormat::Load(const void* model_data, int model_data_len, const DeviceDescriptor& computeDevice)
+{
+    InitializeLotusIR();
+
+    onnx::ModelProto model_proto;
+    const bool result = model_proto.ParseFromArray(model_data, model_data_len);
+    if (!result) {
+        LogicError("protobuf failed to parse model");
+    }
+
+    std::shared_ptr<onnxruntime::Model> model;
+    onnxruntime::common::Status loadStatus = onnxruntime::Model::Load(model_proto, model);
+
     if (!loadStatus.IsOK())
         LogicError("Failed to load model: '%s'", loadStatus.ErrorMessage().c_str());
 

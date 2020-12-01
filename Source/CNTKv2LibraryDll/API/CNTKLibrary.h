@@ -3559,6 +3559,19 @@ namespace CNTK
             return foundFunction;
         }
 
+        //FunctionPtr FindByUid(const std::wstring& uid, bool nestedSearchInsideBlockFunction = false)
+        //{
+        //    FunctionPtr  foundFunction = nullptr;
+        //    PreorderTraverseFunctions(RootFunction(), [&foundFunction, &uid, this](const FunctionPtr& function) {
+        //        if (uid.compare(function->Uid()) == 0)
+        //        { 
+        //            foundFunction = function;
+        //        }
+        //    }, nestedSearchInsideBlockFunction);
+
+        //    return foundFunction;
+        //}
+
         ///
         /// Find a list of functions with the given name in the Function graph underlying 'this' Function.
         /// If nestedSearchInsideBlockFunction is true, all functions inside block functions are also searched for the given name.
@@ -3595,7 +3608,8 @@ namespace CNTK
         ///
         /// Save this Function graph into a model file.
         ///
-        CNTK_API void Save(const std::wstring& filepath, ModelFormat format = ModelFormat::CNTKv2);
+        CNTK_API void Save(const std::wstring& filepath, ModelFormat format = ModelFormat::CNTKv2,
+            bool useExternalFilesToStoreParameters = false);
 
         ///
         /// Restore the models parameters (in-place) from a model file
@@ -3613,7 +3627,8 @@ namespace CNTK
         /// Load a Function from a memory buffer
         ///
         CNTK_API static FunctionPtr Load(const char* buffer, size_t length,
-                                         const DeviceDescriptor& computeDevice = DeviceDescriptor::UseDefaultDevice());
+                                         const DeviceDescriptor& computeDevice = DeviceDescriptor::UseDefaultDevice(),
+                                         ModelFormat format = ModelFormat::CNTKv2);
 
         ///
         /// Load a Function from an istream. The legacy V1 model is not supported.
@@ -6250,7 +6265,7 @@ namespace CNTK
     ///
     /// Built-in MPI-based communicator.
     ///
-    CNTK_API DistributedCommunicatorPtr MPICommunicator(size_t packThresholdSizeInBytes = Internal::GetMPIPackThreshold());
+    CNTK_API DistributedCommunicatorPtr MPICommunicator(size_t packThresholdSizeInBytes = Internal::GetMPIPackThreshold(), bool useFP16AllReduce = false);
 
     ///
     /// Distributed communicator that allows quantized aggregations.
